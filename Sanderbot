@@ -1,0 +1,195 @@
+import telebot
+import mysql.connector
+import schedule
+import time
+from datetime import datetime
+
+# اطلاعات ربات و دیتابیس
+TOKEN = 'توکن_ربات_شما'
+DB_HOST = 'localhost'
+DB_USER = 'root'
+DB_PASSWORD = 'رمز_عبور_شما'
+DB_NAME = 'telegram_bot'
+ADMIN_IDS = [123456789, 987654321]  # لیست آیدی‌های ادمین‌ها
+
+bot = telebot.TeleBot(TOKEN)
+
+# اتصال به دیتابیس
+db = mysql.connector.connect(
+    host=DB_HOST,
+    user=DB_USER,
+    password=DB_PASSWORD,
+    database=DB_NAME
+)
+cursor = db.cursor()
+
+# ذخیره کاربر جدید در دیتابیس
+def add_user(user_id, username, first_name, last_name):
+    cursor.execute("INSERT IGNORE INTO users (user_id, username, first_name, last_name) VALUES (%s, %s, %s, %s)",
+                   (user_id, username, first_name, last_name))
+    db.commit()
+
+# ذخیره محصول جدید در دیتابیس
+def add_product(name, description, price):
+    cursor.execute("INSERT INTO products (name, description, price) VALUES (%s, %s, %s)", (name, description, price))
+    db.commit()
+
+# مشاهده همه محصولات
+def get_products():
+    cursor.execute("SELECT * FROM products")
+    return cursor.fetchall()
+
+# خرید محصول توسط کاربر
+def buy_product(user_id, product_id):
+    cursor.execute("SELECT * FROM products WHERE product_id = %s", (product_id,))
+    product = cursor.fetchone()
+    if product:
+        cursor.execute("INSERT INTO purchases (user_id, product_id) VALUES (%s, %s)", (user_id, product_id))
+        db.commit()
+        return product
+    return None
+
+# فرمان استارت
+@bot.message_handler(commands=['start'])
+def start(message):
+    user_id = message.from_user.id
+    username = message.from_user.username
+    first_name = message.from_user.first_name
+    last_name = message.from_user.last_name
+    add_user(user_id, username, first_name, last_name)
+    bot.send_message(user_id, "سلام! به ربات خوش آمدید. برای خرید محصول از پنل فروش استفاده کنید.")
+
+# فرمان پنل مدیریت
+@bot.message_handler(commands=['admin'])
+def admin_panel(message):
+    if message.from_user.id not in ADMIN_IDS:
+        bot.reply_to(message, "شما دسترسی ندارید.")
+        return
+
+    markup = telebot.types.ReplyKeyboardMarkup(row_width=2)
+    item1 = telebot.types.KeyboardButton('افزودن محصول جدید')
+    item2 = telebot.types.KeyboardButton('مشاهده محصولات')
+    item3 = telebot.types.KeyboardButton('مدیریت کاربران')
+    markup.add(item1, item2, item3)
+
+    bot.send_message(message.chat.id, "پنل مدیریت:", reply_markup=markup)
+
+# افزدون محصول جدید
+@bot.message_handler(func=lambda message: message.text == 'افزودن محصول جدید')
+def add_product_handler(message):
+    if message.from_user.id not in ADMIN_IDS:
+        bot.reply_to(message, "شما دسترسی ندارید.")
+        return
+
+    msg = bot.reply_to(message, "نام محصول را وارد کنید:")
+    bot.register_next_step_handler(msg, add_product_name)
+
+def add_product_name(message):
+    product_name = message.text
+    msg = bot.reply_to(message, "توضیحات محصول را وارد کنید:")
+    bot.register_next_step_handler(msg, add_product_description, product_name)
+
+def add_product_description(message, product_name):
+    product_description = message.text
+    msg = bot.reply_to(message, "قیمت محصول را وارد کنید:")
+    bot.register_next_step_handler(msg, add_product_price, product_name, product_description)
+
+def add_product_price(message, product_name, product_description):
+    try:
+        product_price = float(message.text)
+        add_product(product_name, product_description, product_price)
+        bot.send_message(message.chat.id, f"محصول '{product_name}' با قیمت {product_price} تومان با موفقیت اضافه شد.")
+    except ValueError:
+        bot.send_message(message.chat.id, "قیمت وارد شده معتبر نیست.")
+
+# مشاهده محصولات
+@bot.message_handler(func=lambda message: message.text == 'مشاهده محصولات')
+def view_products(message):
+    products = get_products()
+    if products:
+        response = "\n".join([f"{p[0]}. {p[1]} - {p[2]} تومان\n{p[3]}" for p in products])
+        bot.send_message(message.chat.id, f"محصولات موجود:\n{response}")
+    else:
+        bot.send_message(message.chat.id, "هیچ محصولی وجود ندارد.")
+
+# خرید محصول
+@bot.message_handler(func=lambda message: message.text.startswith('خرید محصول '))
+def buy_product_handler(message):
+    if message.text.startswith('خرید محصول '):
+        try:
+            product_id = int(message.text.split(' ')[2])
+            user_id = message.from_user.id
+            product = buy_product(user_id, product_id)
+            if product:
+                bot.send_message(user_id, f"شما محصول '{product[1]}' را به قیمت {product[2]} تومان خریداری کردید. خرید شما تایید شد.")
+                bot.send_message(ADMIN_IDS[0], f"کاربر {message.from_user.username} محصول '{product[1]}' را خریداری کرد.")
+            else:
+                bot.send_message(user_id, "محصول مورد نظر یافت نشد.")
+        except Exception as e:
+            bot.send_message(user_id, "خطا در خرید محصول.")
+
+# مدیریت کاربران
+@bot.message_handler(func=lambda message: message.text == 'مدیریت کاربران')
+def user_management_handler(message):
+    if message.from_user.id not in ADMIN_IDS:
+        bot.reply_to(message, "شما دسترسی ندارید.")
+        return
+
+    markup = telebot.types.ReplyKeyboardMarkup(row_width=2)
+    item1 = telebot.types.KeyboardButton('بن کاربر')
+    item2 = telebot.types.KeyboardButton('حذف کاربر')
+    item3 = telebot.types.KeyboardButton('جستجو کاربران')
+    markup.add(item1, item2, item3)
+    
+    bot.send_message(message.chat.id, "مدیریت کاربران:", reply_markup=markup)
+
+# بن کاربر
+@bot.message_handler(func=lambda message: message.text == 'بن کاربر')
+def ban_user_handler(message):
+    if message.from_user.id not in ADMIN_IDS:
+        bot.reply_to(message, "شما دسترسی ندارید.")
+        return
+
+    msg = bot.reply_to(message, "آیدی کاربر را وارد کنید:")
+    bot.register_next_step_handler(msg, ban_user)
+
+def ban_user(message):
+    user_id = int(message.text)
+    try:
+        cursor.execute("DELETE FROM users WHERE user_id = %s", (user_id,))
+        db.commit()
+        bot.send_message(message.chat.id, "کاربر بن شد.")
+    except:
+        bot.send_message(message.chat.id, "خطا در بن کاربر.")
+
+# حذف کاربر
+@bot.message_handler(func=lambda message: message.text == 'حذف کاربر')
+def delete_user_handler(message):
+    if message.from_user.id not in ADMIN_IDS:
+        bot.reply_to(message, "شما دسترسی ندارید.")
+        return
+
+    msg = bot.reply_to(message, "آیدی کاربر را وارد کنید:")
+    bot.register_next_step_handler(msg, delete_user)
+
+def delete_user(message):
+    user_id = int(message.text)
+    try:
+        cursor.execute("DELETE FROM users WHERE user_id = %s", (user_id,))
+        db.commit()
+        bot.send_message(message.chat.id, "کاربر حذف شد.")
+    except:
+        bot.send_message(message.chat.id, "خطا در حذف کاربر.")
+
+# اجرا
+def run_schedule():
+    while True:
+        schedule.run_pending()
+        time.sleep(1)
+
+if __name__ == "__main__":
+    print("ربات فعال شد.")
+    import threading
+    thread = threading.Thread(target=run_schedule)
+    thread.start()
+    bot.infinity_polling()
